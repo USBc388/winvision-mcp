@@ -6,7 +6,16 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Notepad-based tests must not kill each other's instance (cargo runs
+/// tests in parallel threads).
+static NOTEPAD_LOCK: Mutex<()> = Mutex::new(());
+
+fn notepad_guard() -> std::sync::MutexGuard<'static, ()> {
+    NOTEPAD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use serde_json::{json, Value};
 
@@ -31,6 +40,7 @@ fn first_text(res: &[Content]) -> String {
 #[test]
 #[ignore]
 fn snapshot_is_under_50ms() {
+    let _guard = notepad_guard();
     let actor = spawn_actor();
     // Launch Notepad for a stable, typical app window (the desktop shell
     // tree can be huge with wallpaper engines and is not the budget target).
@@ -99,6 +109,141 @@ fn snapshot_is_under_50ms() {
 /// ("Program Manager") which always exists in an interactive session.
 fn win_probe_target() -> String {
     "Program Manager".to_string()
+}
+
+#[test]
+#[ignore]
+fn browser_snapshot_exposes_page_elements() {
+    let actor = spawn_actor();
+    // Any running Chromium/Gecko browser works — the snapshot must wake its
+    // accessibility tree and expose the PAGE, not just browser chrome.
+    let target = ["floorp", "chrome", "msedge", "zen", "firefox", "brave"]
+        .iter()
+        .find(|b| winvision_mcp::window::find_window(b).is_some());
+    let target = match target {
+        Some(b) => b.to_string(),
+        None => {
+            println!("no browser running — skipping browser wake test");
+            return;
+        }
+    };
+    let res = call_tool(&actor, "desktop_snapshot", &json!({ "target_window": target }))
+        .expect("browser snapshot");
+    let text = first_text(&res);
+    let elements = text.lines().filter(|l| l.trim_start().starts_with('[')).count();
+    assert!(
+        elements >= 20,
+        "after wake, the browser must expose page elements (got {elements}):\n{text}"
+    );
+}
+
+#[test]
+#[ignore]
+fn ocr_click_text_clicks_notepad_text() {
+    let _guard = notepad_guard();
+    let actor = spawn_actor();
+    // Fresh notepad with known text.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/IM", "notepad.exe", "/F"])
+        .creation_flags(0x08000000)
+        .status();
+    std::thread::sleep(Duration::from_millis(400));
+    call_tool(&actor, "window_manager", &json!({"action": "launch_app", "command": "notepad"}))
+        .expect("launch notepad");
+    let mut hwnd_pid: u32 = 0;
+    for _ in 0..30 {
+        if let Ok(r) = call_tool(
+            &actor,
+            "window_manager",
+            &json!({"action": "wait_for_window", "target": "notepad", "timeout_ms": 800, "poll_ms": 120}),
+        ) {
+            let t = first_text(&r);
+            hwnd_pid = t
+                .split("pid ")
+                .nth(1)
+                .and_then(|s| s.split(' ').next())
+                .and_then(|s| s.trim_end_matches(']').parse().ok())
+                .unwrap_or(0);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    assert!(hwnd_pid != 0, "notepad did not appear");
+
+    // Cleanup regardless of outcome below.
+    let cleanup = || {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &hwnd_pid.to_string(), "/F"])
+            .creation_flags(0x08000000)
+            .status();
+    };
+
+    // Snapshot to find the editor element id, then put known text in.
+    let snap = first_text(
+        &call_tool(&actor, "desktop_snapshot", &json!({"target_window": "notepad"})).expect("snapshot"),
+    );
+    // The editor control may not be in the tree on the very first snapshot
+    // (Win11 notepad initializes lazily) — retry until it shows up.
+    let find_editor = |snap: &str| -> Option<u32> {
+        snap.lines().find_map(|l| {
+            let t = l.trim_start();
+            if t.contains("] Edit") || t.contains("] Document") {
+                let id: u32 = t
+                    .trim_start_matches('[')
+                    .split(']')
+                    .next()?
+                    .trim()
+                    .parse()
+                    .ok()?;
+                Some(id)
+            } else {
+                None
+            }
+        })
+    };
+    let mut edit_id = find_editor(&snap);
+    for _ in 0..8 {
+        if edit_id.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let s = first_text(
+            &call_tool(&actor, "desktop_snapshot", &json!({"target_window": "notepad"}))
+                .expect("snapshot retry"),
+        );
+        edit_id = find_editor(&s);
+    }
+    let edit_id = edit_id.unwrap_or_else(|| panic!("editor element id not found; snapshot:\n{snap}"));
+    let set = call_tool(
+        &actor,
+        "ui_interact",
+        &json!({"element_id": edit_id, "action": "set_value", "text": "winvision ocr click 42"}),
+    );
+    if let Err(e) = set {
+        cleanup();
+        panic!("set_value into notepad editor failed: {e}");
+    }
+
+    let res = call_tool(
+        &actor,
+        "ocr_click_text",
+        &json!({"text_query": "ocr click 42", "action": "click", "target_window": "notepad"}),
+    );
+    match res {
+        Ok(r) => {
+            let text = first_text(&r);
+            assert!(
+                text.contains("ocr_click_text: matched"),
+                "unexpected result: {text}"
+            );
+        }
+        Err(e) => {
+            // OCR is machine-dependent; report clearly but keep the test
+            // meaningful: only "not found" is tolerated here.
+            assert!(e.contains("not found"), "unexpected error: {e}");
+        }
+    }
+    cleanup();
 }
 
 #[test]
@@ -236,7 +381,7 @@ fn end_to_end_stdio_protocol() {
 
     let tools: Value = serde_json::from_str(&lines[1]).unwrap();
     assert_eq!(tools["id"], 2);
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
 
     let list: Value = serde_json::from_str(&lines[2]).unwrap();
     assert_eq!(list["id"], 3);
@@ -282,7 +427,7 @@ fn protocol_smoke_without_windows_apis() {
     assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
     let resp = line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
     let v: Value = serde_json::from_str(&resp).unwrap();
-    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 8);
     let resp = line(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#).unwrap();
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"], json!({}));

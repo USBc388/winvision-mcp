@@ -12,11 +12,15 @@
 //! SendInput click on the element's center.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use windows::core::{BSTR, Interface};
-use windows::Win32::Foundation::{BOOL, HWND, RECT};
+use windows::core::{w, BSTR, Interface};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER};
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowExW, SendMessageTimeoutW, SystemParametersInfoW, SMTO_ABORTIFHUNG, SPIF_SENDCHANGE,
+    SPI_GETSCREENREADER, SPI_SETSCREENREADER, WM_GETOBJECT,
+};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationCondition,
     IUIAutomationElement, IUIAutomationElementArray, IUIAutomationExpandCollapsePattern,
@@ -34,6 +38,69 @@ use windows::Win32::UI::Accessibility::{
 use crate::window::{self, WindowInfo};
 
 pub const CACHE_TTL_MS: u128 = 10_000;
+
+/// Processes that render web pages with an opt-in accessibility tree.
+/// Chromium builds its UIA/IA2 tree lazily; Gecko (Firefox / Zen / Floorp /
+/// LibreWolf) likewise — both wake instantly on WM_GETOBJECT + screen-reader
+/// mode (see `wake_browser_a11y`).
+pub const BROWSER_PROCESSES: &[&str] = &[
+    "chrome.exe",
+    "msedge.exe",
+    "zen.exe",
+    "firefox.exe",
+    "brave.exe",
+    "floorp.exe",
+    "librewolf.exe",
+    "waterfox.exe",
+    "opera.exe",
+    "vivaldi.exe",
+    "thorium.exe",
+    "chromium.exe",
+    "whale.exe",
+];
+
+pub fn is_browser_process(proc_name: &str) -> bool {
+    BROWSER_PROCESSES
+        .iter()
+        .any(|b| proc_name.trim().eq_ignore_ascii_case(b))
+}
+
+/// Web pages nest deeply (div soup); give browsers extra depth when the
+/// caller did not request more.
+pub fn effective_depth(requested: u32, browser: bool) -> u32 {
+    if browser {
+        requested.clamp(14, 15)
+    } else {
+        requested
+    }
+}
+
+fn get_screen_reader_flag() -> BOOL {
+    unsafe {
+        let mut v = BOOL(0);
+        let _ = SystemParametersInfoW(
+            SPI_GETSCREENREADER,
+            0,
+            Some(&mut v as *mut BOOL as *mut std::ffi::c_void),
+            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        v
+    }
+}
+
+fn set_screen_reader_flag(on: bool) {
+    unsafe {
+        let val = BOOL(if on { 1 } else { 0 });
+        // SPIF_SENDCHANGE broadcasts WM_SETTINGCHANGE so running browsers
+        // notice immediately without a restart.
+        let _ = SystemParametersInfoW(
+            SPI_SETSCREENREADER,
+            0,
+            Some(&val as *const BOOL as *const std::ffi::c_void as *mut std::ffi::c_void),
+            SPIF_SENDCHANGE,
+        );
+    }
+}
 
 pub struct UiaCtx {
     automation: IUIAutomation,
@@ -161,6 +228,56 @@ impl UiaCtx {
         }
     }
 
+    /// Wake a browser's accessibility tree: announce screen-reader mode and
+    /// poke the window (and Chromium's renderer child) with WM_GETOBJECT /
+    /// OBJID_CLIENT — the exact probe screen readers make. Chromium and
+    /// Gecko build their full DOM/UIA tree on demand only. Returns the
+    /// previous screen-reader flag if we flipped it (caller restores).
+    fn wake_browser_a11y(&self, hwnd: isize) -> Option<BOOL> {
+        let prev = get_screen_reader_flag();
+        if prev.0 == 0 {
+            set_screen_reader_flag(true);
+        }
+        unsafe {
+            let targets: Vec<HWND> = {
+                let top = HWND(hwnd as *mut _);
+                let mut v = vec![top];
+                // Chromium exposes the page through this child hwnd.
+                if let Ok(renderer) = FindWindowExW(
+                    top,
+                    HWND::default(),
+                    w!("Chrome_RenderWidgetHostHWND"),
+                    None,
+                ) {
+                    if !renderer.0.is_null() {
+                        v.push(renderer);
+                    }
+                }
+                v
+            };
+            for h in targets {
+                let mut result: usize = 0;
+                let _ = SendMessageTimeoutW(
+                    h,
+                    WM_GETOBJECT,
+                    WPARAM(0),
+                    LPARAM(windows::Win32::UI::WindowsAndMessaging::OBJID_CLIENT.0 as isize),
+                    SMTO_ABORTIFHUNG,
+                    1000,
+                    Some(&mut result),
+                );
+            }
+        }
+        // Give the renderer time to build the tree (Chromium needs ~100-250 ms
+        // for a typical page; Gecko is faster).
+        std::thread::sleep(Duration::from_millis(250));
+        if prev.0 == 0 {
+            Some(prev)
+        } else {
+            None
+        }
+    }
+
     /// Snapshot one window's UIA tree into a compact ID-tagged listing.
     pub fn snapshot(
         &mut self,
@@ -168,9 +285,34 @@ impl UiaCtx {
         max_depth: u32,
         max_elements: u32,
     ) -> Result<String, String> {
-        let started = Instant::now();
         let (root_el, info) = self.resolve_root(target)?;
 
+        // Browsers render pages with an opt-in accessibility tree — wake it
+        // first and give web pages extra walk depth.
+        let browser = is_browser_process(&info.process);
+        let prev_screen_reader = if browser {
+            self.wake_browser_a11y(info.hwnd)
+        } else {
+            None
+        };
+
+        let walk_result = self.walk_snapshot(&root_el, &info, max_depth, max_elements, browser);
+
+        if let Some(prev) = prev_screen_reader {
+            set_screen_reader_flag(prev.0 != 0);
+        }
+        walk_result
+    }
+
+    fn walk_snapshot(
+        &mut self,
+        root_el: &IUIAutomationElement,
+        info: &WindowInfo,
+        max_depth: u32,
+        max_elements: u32,
+        browser: bool,
+    ) -> Result<String, String> {
+        let started = Instant::now();
         // Batched subtree fetch; fall back to a minimal property set for
         // providers that reject pattern-availability properties.
         let cached_root = {
@@ -191,7 +333,7 @@ impl UiaCtx {
             rects: HashMap::new(),
             count: 0,
             max_elements: max_elements.clamp(1, 1000),
-            depth_limit: max_depth.clamp(1, 15),
+            depth_limit: effective_depth(max_depth, browser),
         };
         walk(&cached_root, 0, &mut st);
 
@@ -404,6 +546,13 @@ fn keep_node(i: &ElInfo, is_root: bool) -> bool {
     }
     if is_interactive(i) {
         return true;
+    }
+    // Hidden empty wrappers (Gecko emits dozens of unnamed offscreen Menus).
+    if i.offscreen
+        && i.name.trim().is_empty()
+        && i.rect.map(|(_, _, w, h)| w == 0 && h == 0).unwrap_or(true)
+    {
+        return false;
     }
     let unnamed_container = i.name.trim().is_empty()
         && matches!(
@@ -670,5 +819,26 @@ mod tests {
         let i = info("Run Terminal", ctype_id("Button"), Some((1420, 84, 32, 32)), true);
         let line = fmt_line(2, 1, &i);
         assert!(line.contains("[2] Button \"Run Terminal\" (x: 1420, y: 84, w: 32, h: 32)"));
+    }
+
+    #[test]
+    fn browser_detection() {
+        for b in ["chrome.exe", "Chrome.EXE", "msedge.exe", "zen.exe", "firefox.exe",
+                  "brave.exe", "floorp.exe", "librewolf.exe"] {
+            assert!(is_browser_process(b), "must detect {b}");
+        }
+        assert!(is_browser_process(" floorp.exe "), "trims whitespace");
+        for n in ["notepad.exe", "explorer.exe", "zcode.exe", ""] {
+            assert!(!is_browser_process(n), "must not detect {n}");
+        }
+    }
+
+    #[test]
+    fn browser_depth_bumped_to_14() {
+        assert_eq!(effective_depth(6, true), 14);
+        assert_eq!(effective_depth(12, true), 14);
+        assert_eq!(effective_depth(15, true), 15);
+        assert_eq!(effective_depth(6, false), 6);
+        assert_eq!(effective_depth(3, false), 3);
     }
 }

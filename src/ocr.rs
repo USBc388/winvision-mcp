@@ -7,10 +7,18 @@ use windows::Media::Ocr::OcrEngine;
 use windows::Security::Cryptography::CryptographicBuffer;
 
 #[derive(Debug, Clone)]
+pub struct OcrWordInfo {
+    pub text: String,
+    /// Image-local rect (x, y, w, h).
+    pub rect: (i32, i32, i32, i32),
+}
+
+#[derive(Debug, Clone)]
 pub struct OcrLineInfo {
     pub text: String,
     /// Image-local rect (x, y, w, h).
     pub rect: (i32, i32, i32, i32),
+    pub words: Vec<OcrWordInfo>,
 }
 
 #[derive(Debug)]
@@ -18,6 +26,89 @@ pub struct OcrOutput {
     pub text: String,
     pub lines: Vec<OcrLineInfo>,
     pub language: String,
+}
+
+/// Union of i32 rects (for word runs).
+fn union_i32(rs: &[(i32, i32, i32, i32)]) -> (i32, i32, i32, i32) {
+    if rs.is_empty() {
+        return (0, 0, 0, 0);
+    }
+    let x0 = rs.iter().map(|r| r.0).min().unwrap_or(0);
+    let y0 = rs.iter().map(|r| r.1).min().unwrap_or(0);
+    let x1 = rs.iter().map(|r| r.0 + r.2).max().unwrap_or(0);
+    let y1 = rs.iter().map(|r| r.1 + r.3).max().unwrap_or(0);
+    (x0, y0, (x1 - x0).max(0), (y1 - y0).max(0))
+}
+
+/// Find the tightest rect matching `query` among OCR lines. Preference
+/// order: exact single word -> exact contiguous word run -> single word
+/// containing the query -> word run containing the query -> whole line
+/// containing the query. Case-insensitive. Rects are image-local.
+pub fn find_query_rect(query: &str, lines: &[OcrLineInfo]) -> Option<(i32, i32, i32, i32)> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    // Pass 1: exact single word.
+    for line in lines {
+        for w in &line.words {
+            if w.text.to_lowercase() == q {
+                return Some(w.rect);
+            }
+        }
+    }
+    // Pass 2: exact contiguous run of words ("Sign" + "in" == "sign in").
+    for line in lines {
+        let words = &line.words;
+        for start in 0..words.len() {
+            let mut text = String::new();
+            let mut run: Vec<(i32, i32, i32, i32)> = Vec::new();
+            for w in &words[start..] {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&w.text);
+                run.push(w.rect);
+                if text.to_lowercase() == q {
+                    return Some(union_i32(&run));
+                }
+            }
+        }
+    }
+    // Pass 3: single word containing the query ("Continue..." contains
+    // "continue").
+    for line in lines {
+        for w in &line.words {
+            if w.text.to_lowercase().contains(&q) {
+                return Some(w.rect);
+            }
+        }
+    }
+    // Pass 4: word run containing the query (punctuation glued to words).
+    for line in lines {
+        let words = &line.words;
+        for start in 0..words.len() {
+            let mut text = String::new();
+            let mut run: Vec<(i32, i32, i32, i32)> = Vec::new();
+            for w in &words[start..] {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&w.text);
+                run.push(w.rect);
+                if text.to_lowercase().contains(&q) {
+                    return Some(union_i32(&run));
+                }
+            }
+        }
+    }
+    // Pass 5: whole line fallback.
+    for line in lines {
+        if line.text.to_lowercase().contains(&q) {
+            return Some(line.rect);
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -96,6 +187,7 @@ impl OcrCtx {
                 .Text()
                 .map(|t| t.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let mut words_out: Vec<OcrWordInfo> = Vec::new();
             let mut rects: Vec<(f32, f32, f32, f32)> = Vec::new();
             if let Ok(words) = line.Words() {
                 let wn = words.Size().unwrap_or(0);
@@ -103,6 +195,18 @@ impl OcrCtx {
                     if let Ok(word) = words.GetAt(wi) {
                         if let Ok(r) = word.BoundingRect() {
                             rects.push((r.X, r.Y, r.Width, r.Height));
+                            words_out.push(OcrWordInfo {
+                                text: word
+                                    .Text()
+                                    .map(|t| t.to_string_lossy().to_string())
+                                    .unwrap_or_default(),
+                                rect: (
+                                    r.X.round() as i32,
+                                    r.Y.round() as i32,
+                                    r.Width.round().max(0.0) as i32,
+                                    r.Height.round().max(0.0) as i32,
+                                ),
+                            });
                         }
                     }
                 }
@@ -110,6 +214,7 @@ impl OcrCtx {
             lines_out.push(OcrLineInfo {
                 text,
                 rect: union_rects(&rects),
+                words: words_out,
             });
         }
         let full = result
@@ -210,6 +315,53 @@ pub fn available_languages() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a line from (word_text, x) pairs, 10px wide/tall words.
+    fn mkline(words: &[(&str, i32)]) -> OcrLineInfo {
+        OcrLineInfo {
+            text: words.iter().map(|w| w.0).collect::<Vec<_>>().join(" "),
+            rect: (0, 0, 100, 10),
+            words: words
+                .iter()
+                .map(|(t, x)| OcrWordInfo {
+                    text: t.to_string(),
+                    rect: (*x, 0, 10, 10),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn find_query_rect_matching_passes() {
+        let lines = vec![
+            mkline(&[("Sign", 0), ("in", 20), ("to", 40)]),
+            mkline(&[("Continue...", 60)]),
+        ];
+        // Pass 1: exact single word ("in" beats the "Sign in" run).
+        assert_eq!(find_query_rect("in", &lines), Some((20, 0, 10, 10)));
+        // Pass 2: exact word run across word boundaries.
+        assert_eq!(find_query_rect("Sign in", &lines), Some((0, 0, 30, 10)));
+        // Case-insensitive.
+        assert_eq!(find_query_rect("sign IN", &lines), Some((0, 0, 30, 10)));
+        // Pass 3: single word containing the query (punctuation glued).
+        assert_eq!(find_query_rect("continue", &lines), Some((60, 0, 10, 10)));
+        // No match at all.
+        assert_eq!(find_query_rect("absent", &lines), None);
+        // Empty query.
+        assert_eq!(find_query_rect("  ", &lines), None);
+    }
+
+    #[test]
+    fn find_query_rect_run_containing_fallback() {
+        // "gn in" is not a whole word/run, but it IS a substring of the
+        // "Sign in" run -> pass 4 returns the covering run rect.
+        let lines = vec![mkline(&[("Sign", 0), ("in", 20)])];
+        assert_eq!(find_query_rect("gn in", &lines), Some((0, 0, 30, 10)));
+        // Punctuation gluing: "Sign-in" single word, query "sign-in".
+        let lines2 = vec![mkline(&[("Sign-in", 0), ("page", 20)])];
+        assert_eq!(find_query_rect("sign-in", &lines2), Some((0, 0, 10, 10)));
+        assert_eq!(find_query_rect("sign-in page", &lines2), Some((0, 0, 30, 10)));
+    }
 
     #[test]
     fn union_rects_math() {

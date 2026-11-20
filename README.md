@@ -16,8 +16,9 @@ OCR области экрана — **44 мс**, захват+SoM-разметк
 
 | Tool | Назначение | Скорость |
 |---|---|---|
-| `desktop_snapshot` | «Рентген» окна через UI Automation: список интерактивных элементов с ID `[N]` и координатами | тёплый ~10–50 мс |
-| `ui_interact` | click / double_click / right_click / focus / set_value / toggle по `element_id`; сначала нативные паттерны (Invoke/Value/Toggle/SelectionItem/ExpandCollapse), fallback — аппаратный SendInput-клик | мс |
+| `desktop_snapshot` | «Рентген» окна через UI Automation: список интерактивных элементов с ID `[N]` и координатами. Браузеры (Chrome/Edge/Firefox/Zen/Floorp/Brave) будятся автоматически (WM_GETOBJECT + screen-reader flag), глубина обхода 14 | тёплый ~10–50 мс |
+| `ui_interact` | click / double_click / right_click / focus / set_value / toggle по `element_id`; сначала нативные паттерны (Invoke/Value/Toggle/SelectionItem/ExpandCollapse), fallback — аппаратный SendInput-клик | ~0.3–5 мс |
+| `ocr_click_text` | Клик точно по тексту на экране: захват (DXGI/GDI) → OCR → bounding box найденного текста → SendInput-клик в центр; `type_after_click` вставляет текст через Ctrl+V. Работает на сайтах без UIA-дерева, Canvas, капчах | ~50–150 мс |
 | `visual_som_capture` | JPEG-кадр через DXGI Desktop Duplication с бейджами Set-of-Mark на окнах/OCR-строках + таблица координат | < 5 мс захват |
 | `ocr_read_region` | Оффлайн-OCR региона (Windows.Media.Ocr), построчные боксы в экранных координатах | ~20–50 мс |
 | `window_manager` | list_windows, focus, minimize/maximize/restore, snap_left/right/full, launch_app, wait_for_window (с OCR-проверкой текста), recent_events (SetWinEventHook) | мс |

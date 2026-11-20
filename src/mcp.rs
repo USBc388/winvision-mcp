@@ -196,6 +196,20 @@ pub fn tool_defs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "ocr_click_text",
+            "description": "Click directly on text found by OCR: captures the window (DXGI/GDI), OCRs it, finds the exact bounding box of text_query, moves the mouse to its center and clicks via SendInput. Works on ANY site, canvas, captcha or custom renderer even when the browser exposes no UIA tree. action=type_after_click clicks the text and then pastes input_text via Ctrl+V.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text_query": {"type": "string", "description": "text to find and click, exactly as shown on screen (case-insensitive)"},
+                    "action": {"type": "string", "enum": ["click", "double_click", "type_after_click"], "description": "what to do at the text position (default click)"},
+                    "input_text": {"type": "string", "description": "text to paste for action=type_after_click"},
+                    "target_window": {"type": "string", "description": "window title/process substring to search in (default: the foreground window)"}
+                },
+                "required": ["text_query"]
+            }
+        }),
+        json!({
             "name": "window_manager",
             "description": "Window/workspace management: list_windows, focus_window, minimize, maximize, restore, snap_left, snap_right, snap_full, launch_app, wait_for_window (event-less polling with OCR text match), recent_events (SetWinEventHook feed).",
             "inputSchema": {
@@ -367,6 +381,7 @@ pub fn call_tool(actor: &Actor, name: &str, args: &Value) -> Result<Vec<Content>
             })?;
             Ok(vec![Content::Text(out)])
         }
+        "ocr_click_text" => ocr_click_text_tool(actor, args),
         "window_manager" => window_manager_tool(actor, args),
         "input_macro" => input_macro_tool(actor, args),
         "clipboard" => {
@@ -382,13 +397,103 @@ pub fn call_tool(actor: &Actor, name: &str, args: &Value) -> Result<Vec<Content>
             Ok(vec![Content::Text(out)])
         }
         _ => Err(format!(
-            "unknown tool '{name}' — available: desktop_snapshot, ui_interact, visual_som_capture, ocr_read_region, window_manager, input_macro, clipboard"
+            "unknown tool '{name}' — available: desktop_snapshot, ui_interact, visual_som_capture, ocr_read_region, ocr_click_text, window_manager, input_macro, clipboard"
         )),
     }
 }
 
-fn region_center(r: &(i32, i32, i32, i32)) -> (i32, i32) {
-    if r.2 > 0 && r.3 > 0 {
+// ---------- ocr_click_text ----------
+
+/// Capture a window region, OCR it, locate `text_query` precisely and act
+/// with the mouse at its center — works even with zero UIA support.
+fn ocr_click_text_tool(actor: &Actor, args: &Value) -> Result<Vec<Content>, String> {
+    let text_query = arg_str(args, "text_query")
+        .ok_or("ocr_click_text requires text_query (text to find on screen)")?;
+    let action = arg_str(args, "action").unwrap_or_else(|| "click".into());
+    let input_text = arg_str(args, "input_text");
+    let target = arg_str(args, "target_window");
+    let out = block(actor, move |ctx| {
+        // Search region: target window or the foreground window.
+        let (win_rect, win_title) = match &target {
+            Some(t) => {
+                let w = window::find_window(t)
+                    .ok_or_else(|| format!("no window matches '{t}'"))?;
+                ((w.x, w.y, w.w, w.h), w.title)
+            }
+            None => {
+                let fg = window::foreground_hwnd();
+                if fg == 0 {
+                    return Err("no foreground window; pass target_window".into());
+                }
+                let w = window::window_info(windows::Win32::Foundation::HWND(fg as *mut _))
+                    .ok_or("foreground window vanished")?;
+                ((w.x, w.y, w.w, w.h), w.title)
+            }
+        };
+        if win_rect.2 <= 0 || win_rect.3 <= 0 {
+            return Err("target window has an empty rect".into());
+        }
+        let frame = crate::dxgi::with(|dx| {
+            dx.capture_for_point((win_rect.0 + win_rect.2 / 2, win_rect.1 + win_rect.3 / 2))
+        })?;
+        let x0 = (win_rect.0 - frame.origin.0).max(0);
+        let y0 = (win_rect.1 - frame.origin.1).max(0);
+        let cw = (win_rect.2 as u32)
+            .min(frame.w.saturating_sub(x0 as u32))
+            .max(1);
+        let ch = (win_rect.3 as u32)
+            .min(frame.h.saturating_sub(y0 as u32))
+            .max(1);
+        let (crop, cw, ch) =
+            crate::dxgi::crop_bgra(&frame.bgra, frame.w, frame.h, x0, y0, cw, ch);
+        let crop_origin = (frame.origin.0 + x0, frame.origin.1 + y0);
+        let ocr = ctx.ocr()?.recognize(&crop, cw, ch, None)?;
+        let m = crate::ocr::find_query_rect(&text_query, &ocr.lines).ok_or_else(|| {
+            format!(
+                "text '{text_query}' not found on screen (OCR read {} lines in \"{}\")",
+                ocr.lines.len(),
+                win_title
+            )
+        })?;
+        let sx = crop_origin.0 + m.0;
+        let sy = crop_origin.1 + m.1;
+        let cx = sx + m.2 / 2;
+        let cy = sy + m.3 / 2;
+        let done = match action.as_str() {
+            "click" => crate::input::click_at(cx, cy, "left", 1)?,
+            "double_click" => crate::input::click_at(cx, cy, "left", 2)?,
+            "type_after_click" => {
+                crate::input::click_at(cx, cy, "left", 1)?;
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let it = input_text
+                    .ok_or("type_after_click requires 'input_text'")?;
+                // Clipboard + Ctrl+V is fast and unicode-safe; fall back to
+                // char typing when the clipboard is busy.
+                match crate::clipboard::set_text(&it) {
+                    Ok(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(80));
+                        crate::input::send_hotkey("Ctrl+v")?;
+                        format!("pasted {} chars via Ctrl+V", it.chars().count())
+                    }
+                    Err(_) => crate::input::type_text(&it)?,
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown action '{other}' (use click|double_click|type_after_click)"
+                ))
+            }
+        };
+        Ok(format!(
+            "ocr_click_text: matched \"{text_query}\" at (x: {sx}, y: {sy}, w: {w}, h: {h}) screen px, {done}",
+            w = m.2,
+            h = m.3
+        ))
+    })?;
+    Ok(vec![Content::Text(out)])
+}
+
+fn region_center(r: &(i32, i32, i32, i32)) -> (i32, i32) {    if r.2 > 0 && r.3 > 0 {
         (r.0 + r.2 / 2, r.1 + r.3 / 2)
     } else {
         cursor_point()
@@ -741,9 +846,9 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_seven_valid_schemas() {
+    fn tools_list_has_eight_valid_schemas() {
         let tools = tool_defs();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         for t in &tools {
             assert!(t["name"].is_string(), "tool missing name");
             assert_eq!(t["inputSchema"]["type"], "object", "schema must be an object schema");
@@ -755,12 +860,25 @@ mod tests {
             "ui_interact",
             "visual_som_capture",
             "ocr_read_region",
+            "ocr_click_text",
             "window_manager",
             "input_macro",
             "clipboard",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+        // ocr_click_text must require text_query only.
+        let oct = tools
+            .iter()
+            .find(|t| t["name"] == "ocr_click_text")
+            .expect("ocr_click_text schema");
+        let req: Vec<&str> = oct["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(req, vec!["text_query"]);
     }
 
     #[test]
