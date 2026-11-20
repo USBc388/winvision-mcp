@@ -1,82 +1,86 @@
 # WinVision MCP
 
-Сверхбыстрый локальный MCP-сервер (Model Context Protocol, stdio JSON-RPC 2.0)
-для ZCode: нативное «зрение» и управление рабочим столом Windows на чистом
-Rust. Заменяет медленный цикл «скриншот → угадывание пикселей → клик» на
-мгновенный доступ к дереву UI Automation, аппаратный захват экрана DXGI и
-событийный мониторинг окон.
+An ultra-fast local MCP server (Model Context Protocol, stdio JSON-RPC 2.0)
+for ZCode: native Windows "vision" and desktop control in pure Rust. It
+replaces the slow screenshot → pixel-guessing → click loop with instant
+access to the UI Automation tree, hardware-level DXGI screen capture and
+event-driven window monitoring.
 
-**Скорость (p50, полная JSON-RPC round trip, живой десктоп):**
-тёплый снапшот окна — **34 мс**, нажатие кнопки через UIA-паттерн — **0.3 мс**,
-OCR области экрана — **44 мс**, захват+SoM-разметка — **72 мс**.
-Полные бенчмарки: [BENCHMARKS.md](BENCHMARKS.md). Готовый exe — в
+**Speed (p50, full JSON-RPC round trip, live desktop):** warm window
+snapshot — **34 ms**, button click via a UIA pattern — **0.3 ms**, screen
+region OCR — **44 ms**, capture + Set-of-Mark overlay — **72 ms**.
+Full benchmarks: [BENCHMARKS.md](BENCHMARKS.md). Prebuilt exe in
 [Releases](../../releases).
 
-## Инструменты
+## Tools
 
-| Tool | Назначение | Скорость |
+| Tool | Purpose | Speed |
 |---|---|---|
-| `desktop_snapshot` | «Рентген» окна через UI Automation: список интерактивных элементов с ID `[N]` и координатами. Браузеры (Chrome/Edge/Firefox/Zen/Floorp/Brave) будятся автоматически (WM_GETOBJECT + screen-reader flag), глубина обхода 14 | тёплый ~10–50 мс |
-| `ui_interact` | click / double_click / right_click / focus / set_value / toggle по `element_id`; сначала нативные паттерны (Invoke/Value/Toggle/SelectionItem/ExpandCollapse), fallback — аппаратный SendInput-клик | ~0.3–5 мс |
-| `ocr_click_text` | Клик точно по тексту на экране: захват (DXGI/GDI) → OCR → bounding box найденного текста → SendInput-клик в центр; `type_after_click` вставляет текст через Ctrl+V. Работает на сайтах без UIA-дерева, Canvas, капчах | ~50–150 мс |
-| `visual_som_capture` | JPEG-кадр через DXGI Desktop Duplication с бейджами Set-of-Mark на окнах/OCR-строках + таблица координат | < 5 мс захват |
-| `ocr_read_region` | Оффлайн-OCR региона (Windows.Media.Ocr), построчные боксы в экранных координатах | ~20–50 мс |
-| `window_manager` | list_windows, focus, minimize/maximize/restore, snap_left/right/full, launch_app, wait_for_window (с OCR-проверкой текста), recent_events (SetWinEventHook) | мс |
-| `input_macro` | hotkey (`Ctrl+Shift+P`), type_text (Unicode), click/move/drag/scroll | мс |
-| `clipboard` | get/set CF_UNICODETEXT | мс |
+| `desktop_snapshot` | Instant "X-ray" of a window via UI Automation: interactive elements with short IDs `[N]` and screen rects. Browsers (Chrome/Edge/Firefox/Zen/Floorp/Brave) are woken automatically (WM_GETOBJECT + screen-reader flag) with walk depth 14 | warm ~10–50 ms |
+| `ui_interact` | click / double_click / right_click / focus / set_value / toggle by `element_id`; tries native patterns first (Invoke/Value/Toggle/SelectionItem/ExpandCollapse), falls back to a hardware SendInput click | ~0.3–5 ms |
+| `ocr_click_text` | Click exactly on text on screen: capture (DXGI/GDI) → OCR → bounding box of the found text → SendInput click at its center; `type_after_click` pastes text via Ctrl+V. Works on sites with no UIA tree, Canvas, captchas | ~50–150 ms |
+| `visual_som_capture` | JPEG frame via DXGI Desktop Duplication with Set-of-Mark badges on windows/OCR lines + a coordinate table | < 5 ms capture |
+| `ocr_read_region` | Offline OCR of any region (Windows.Media.Ocr), per-line boxes in screen coordinates | ~20–50 ms |
+| `window_manager` | list_windows, focus, minimize/maximize/restore, snap_left/right/full, launch_app, wait_for_window (with OCR text check), recent_events (SetWinEventHook) | ms |
+| `input_macro` | hotkey (`Ctrl+Shift+P`), type_text (Unicode), click/move/drag/scroll | ms |
+| `clipboard` | get/set CF_UNICODETEXT | ms |
 
-## Архитектура
+## Architecture
 
 ```
 src/
-  main.rs    — запуск: DPI-aware, COM-actor, tokio-stdio
-  mcp.rs     — MCP-транспорт: initialize/tools/list/tools/call, схемы 7 инструментов
-  actor.rs   — выделенный COM-поток (CoInitializeEx MTA + message pump), все Win32/COM вызовы
-  uia.rs     — UIA: батч-кэш дерева (BuildUpdatedCache, TreeScope=Subtree — 1 round-trip),
-               кэш ID→элемент на 10 с, паттерны + fallback
-  dxgi.rs    — DXGI Desktop Duplication: 1 дублирование на процесс (глобальный singleton),
-               переживает ACCESS_LOST/смену режима/монитора
-  som.rs     — Set-of-Mark: цветные бейджи с номерами (встроенный шрифт 5x7), сетка, JPEG
-  ocr.rs     — Windows.Media.Ocr: создание движка с фолбэками, построчные боксы
-  window.rs  — EnumWindows/ShowWindow/snap/launch (обход foreground-lock через Alt-тап)
-  events.rs  — SetWinEventHook (foreground/show/destroy/namechange) в ring-buffer
-  input.rs   — SendInput: хоткеи, Unicode-печать, интерполированный drag, колесо
+  main.rs      — startup: DPI-aware, COM actor, tokio stdio
+  mcp.rs       — MCP transport: initialize/tools/list/tools/call, schemas for 8 tools
+  actor.rs     — dedicated COM thread (CoInitializeEx MTA + message pump), all Win32/COM calls
+  uia.rs       — UIA: batched tree cache (BuildUpdatedCache, TreeScope=Subtree — 1 round trip),
+                 10 s ID→element cache, patterns + fallback, browser accessibility auto-wake
+  dxgi.rs      — DXGI Desktop Duplication: one duplication per process (global singleton),
+                 survives ACCESS_LOST / mode changes / monitor switches, GDI fallback
+  som.rs       — Set-of-Mark: numbered color badges (built-in 5x7 font), grid, JPEG
+  ocr.rs       — Windows.Media.Ocr: engine creation with fallbacks, word/line boxes
+  window.rs    — EnumWindows/ShowWindow/snap/launch (foreground-lock workaround via Alt tap)
+  events.rs    — SetWinEventHook (foreground/show/destroy/namechange) into a ring buffer
+  input.rs     — SendInput: hotkeys, Unicode typing, interpolated drag, wheel
   clipboard.rs — CF_UNICODETEXT
 ```
 
-## Сборка
+## Building
 
 ```powershell
 cargo build --release     # target/release/winvision-mcp.exe
 cargo clippy --all-targets
-cargo test                # 39 unit-тестов
-cargo test -- --ignored   # 8 интеграционных (реальные UIA/DXGI/OCR/stdio, нужен интерактивный десктоп)
+cargo test                # 43 unit tests
+cargo test -- --ignored   # 10 integration tests (real UIA/DXGI/OCR/stdio, needs an interactive desktop)
 ```
 
-## Подключение к ZCode
+## Connecting to ZCode
 
-`~/.zcode/cli/config.json`:
+In `~/.zcode/cli/config.json`:
 ```json
 "mcp": { "servers": { "winvision": {
-  "command": "F:\\skill creation\\winvision-mcp\\target\\release\\winvision-mcp.exe",
+  "command": "C:\\tools\\winvision-mcp.exe",
   "args": []
 } } }
 ```
 
-Скилл с правилами работы: `.zcode/skills/winvision/SKILL.md` (проект) и
-`~/.zcode/skills/winvision/SKILL.md` (глобально).
+A skill file describing usage rules lives in
+`.zcode/skills/winvision/SKILL.md` (per-project) and
+`~/.zcode/skills/winvision/SKILL.md` (global).
 
-Проверка вручную:
+Manual smoke check:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-release.ps1
 ```
 
-## Замечания
+## Notes
 
-- Первый вызов UIA в процессе — холодная инициализация COM (~300–700 мс);
-  тёплые снапшоты типичных окон — 10–50 мс. Окно рабочего стола шелла
-  (`Program Manager`) отвечает провайдеру ~650 мс — это ограничение
-  explorer'а, не сервера.
-- Для Chrome/Edge/Electron при пустом снапшоте — кликните в окно или
-  запустите с `--force-renderer-accessibility`.
-- OCR требует установленного языкового пакета Windows (en-US/ru-RU и т.д.).
+- The first UIA call in a process pays cold COM initialization (~300–700 ms);
+  warm snapshots of typical windows take 10–50 ms. The desktop shell window
+  (`Program Manager`) answers its provider in ~650 ms — an explorer-side
+  limitation, not a server one.
+- Browsers wake their accessibility tree on demand; the server sends the
+  wake probe automatically on every browser snapshot (v0.2.0+).
+- Fully static screens (e.g. an animated-wallpaper app paused behind a
+  focused window can stop NVIDIA from delivering duplication frames) fall
+  back to a GDI BitBlt capture automatically.
+- OCR requires a Windows language pack (en-US / ru-RU, etc.).

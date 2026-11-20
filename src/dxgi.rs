@@ -334,7 +334,8 @@ impl DxgiCtx {
                     .AcquireNextFrame(200, &mut frame_info, &mut resource_opt)
             {
                 // Classify by HRESULT code, not message text (Windows
-                // localizes error messages: "Время ожидания истекло"...).
+                // localizes errors, e.g. the Russian DXGI timeout message
+                // "Время ожидания истекло" contains no English "timeout").
                 match e.code().0 as u32 {
                     0x887A_0027 => {
                         // DXGI_ERROR_WAIT_TIMEOUT: screen did not change.
