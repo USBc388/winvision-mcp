@@ -17,6 +17,7 @@ pub mod clipboard;
 pub mod dxgi;
 pub mod events;
 pub mod input;
+pub mod macros;
 pub mod mcp;
 pub mod ocr;
 pub mod som;

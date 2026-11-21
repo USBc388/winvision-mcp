@@ -210,6 +210,21 @@ pub fn tool_defs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "system_macro",
+            "description": "Replayable system macros: run a SEQUENCE of steps (focus window, click, type, hotkey, scroll, drag, wait, launch app, OCR-click, clipboard) in ONE call with inter-step delays — saves tokens vs many round trips, and guarantees ordering. Save named macros to disk (stored in %USERPROFILE%\\.winvision-mcp\\macros) and rerun them anytime: list/load/delete.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["run", "save", "load", "list", "delete"], "description": "run: execute inline steps or a saved macro; save: store steps under name; load: execute saved macro; list; delete"},
+                    "steps": {"type": "array", "description": "array of step objects, e.g. [{\"action\":\"focus\",\"target\":\"notepad\"},{\"action\":\"type\",\"text\":\"hi\"},{\"action\":\"hotkey\",\"keys\":\"Ctrl+s\"},{\"action\":\"wait\",\"ms\":300}]. Actions: hotkey(keys), type(text), click(x,y,button?,clicks?), double_click(x,y), right_click(x,y), move(x,y), drag(x,y,to_x,to_y,duration_ms?), scroll(delta,x?,y?), wait(ms), focus(target), launch(command,args?), ocr_click(text_query,action?,input_text?,target_window?), clipboard_set(text). Max 50 steps.",
+                        "items": {"type": "object"}},
+                    "name": {"type": "string", "description": "macro name for save/load/delete"},
+                    "step_delay_ms": {"type": "integer", "description": "delay between steps in ms (default 150, max 2000)"}
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
             "name": "window_manager",
             "description": "Window/workspace management: list_windows, focus_window, minimize, maximize, restore, snap_left, snap_right, snap_full, launch_app, wait_for_window (event-less polling with OCR text match), recent_events (SetWinEventHook feed).",
             "inputSchema": {
@@ -382,6 +397,7 @@ pub fn call_tool(actor: &Actor, name: &str, args: &Value) -> Result<Vec<Content>
             Ok(vec![Content::Text(out)])
         }
         "ocr_click_text" => ocr_click_text_tool(actor, args),
+        "system_macro" => system_macro_tool(actor, args),
         "window_manager" => window_manager_tool(actor, args),
         "input_macro" => input_macro_tool(actor, args),
         "clipboard" => {
@@ -397,7 +413,7 @@ pub fn call_tool(actor: &Actor, name: &str, args: &Value) -> Result<Vec<Content>
             Ok(vec![Content::Text(out)])
         }
         _ => Err(format!(
-            "unknown tool '{name}' — available: desktop_snapshot, ui_interact, visual_som_capture, ocr_read_region, ocr_click_text, window_manager, input_macro, clipboard"
+            "unknown tool '{name}' — available: desktop_snapshot, ui_interact, visual_som_capture, ocr_read_region, ocr_click_text, system_macro, window_manager, input_macro, clipboard"
         )),
     }
 }
@@ -406,6 +422,88 @@ pub fn call_tool(actor: &Actor, name: &str, args: &Value) -> Result<Vec<Content>
 
 /// Capture a window region, OCR it, locate `text_query` precisely and act
 /// with the mouse at its center — works even with zero UIA support.
+/// Shared by the `ocr_click_text` tool and the `ocr_click` macro step.
+pub(crate) fn ocr_click_impl(
+    ctx: &mut crate::actor::Ctx,
+    text_query: &str,
+    action: &str,
+    input_text: Option<&str>,
+    target: Option<&str>,
+) -> Result<String, String> {
+    // Search region: target window or the foreground window.
+    let (win_rect, win_title) = match target {
+        Some(t) => {
+            let w = window::find_window(t).ok_or_else(|| format!("no window matches '{t}'"))?;
+            ((w.x, w.y, w.w, w.h), w.title)
+        }
+        None => {
+            let fg = window::foreground_hwnd();
+            if fg == 0 {
+                return Err("no foreground window; pass target_window".into());
+            }
+            let w = window::window_info(windows::Win32::Foundation::HWND(fg as *mut _))
+                .ok_or("foreground window vanished")?;
+            ((w.x, w.y, w.w, w.h), w.title)
+        }
+    };
+    if win_rect.2 <= 0 || win_rect.3 <= 0 {
+        return Err("target window has an empty rect".into());
+    }
+    let frame =
+        crate::dxgi::with(|dx| dx.capture_for_point((win_rect.0 + win_rect.2 / 2, win_rect.1 + win_rect.3 / 2)))?;
+    let x0 = (win_rect.0 - frame.origin.0).max(0);
+    let y0 = (win_rect.1 - frame.origin.1).max(0);
+    let cw = (win_rect.2 as u32)
+        .min(frame.w.saturating_sub(x0 as u32))
+        .max(1);
+    let ch = (win_rect.3 as u32)
+        .min(frame.h.saturating_sub(y0 as u32))
+        .max(1);
+    let (crop, cw, ch) = crate::dxgi::crop_bgra(&frame.bgra, frame.w, frame.h, x0, y0, cw, ch);
+    let crop_origin = (frame.origin.0 + x0, frame.origin.1 + y0);
+    let ocr = ctx.ocr()?.recognize(&crop, cw, ch, None)?;
+    let m = crate::ocr::find_query_rect(text_query, &ocr.lines).ok_or_else(|| {
+        format!(
+            "text '{text_query}' not found on screen (OCR read {} lines in \"{}\")",
+            ocr.lines.len(),
+            win_title
+        )
+    })?;
+    let sx = crop_origin.0 + m.0;
+    let sy = crop_origin.1 + m.1;
+    let cx = sx + m.2 / 2;
+    let cy = sy + m.3 / 2;
+    let done = match action {
+        "click" => crate::input::click_at(cx, cy, "left", 1)?,
+        "double_click" => crate::input::click_at(cx, cy, "left", 2)?,
+        "type_after_click" => {
+            crate::input::click_at(cx, cy, "left", 1)?;
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let it = input_text.ok_or("type_after_click requires 'input_text'")?;
+            // Clipboard + Ctrl+V is fast and unicode-safe; fall back to
+            // char typing when the clipboard is busy.
+            match crate::clipboard::set_text(it) {
+                Ok(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    crate::input::send_hotkey("Ctrl+v")?;
+                    format!("pasted {} chars via Ctrl+V", it.chars().count())
+                }
+                Err(_) => crate::input::type_text(it)?,
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown action '{other}' (use click|double_click|type_after_click)"
+            ))
+        }
+    };
+    Ok(format!(
+        "matched \"{text_query}\" at (x: {sx}, y: {sy}, w: {w}, h: {h}) screen px, {done}",
+        w = m.2,
+        h = m.3
+    ))
+}
+
 fn ocr_click_text_tool(actor: &Actor, args: &Value) -> Result<Vec<Content>, String> {
     let text_query = arg_str(args, "text_query")
         .ok_or("ocr_click_text requires text_query (text to find on screen)")?;
@@ -413,84 +511,190 @@ fn ocr_click_text_tool(actor: &Actor, args: &Value) -> Result<Vec<Content>, Stri
     let input_text = arg_str(args, "input_text");
     let target = arg_str(args, "target_window");
     let out = block(actor, move |ctx| {
-        // Search region: target window or the foreground window.
-        let (win_rect, win_title) = match &target {
-            Some(t) => {
-                let w = window::find_window(t)
-                    .ok_or_else(|| format!("no window matches '{t}'"))?;
-                ((w.x, w.y, w.w, w.h), w.title)
-            }
-            None => {
-                let fg = window::foreground_hwnd();
-                if fg == 0 {
-                    return Err("no foreground window; pass target_window".into());
-                }
-                let w = window::window_info(windows::Win32::Foundation::HWND(fg as *mut _))
-                    .ok_or("foreground window vanished")?;
-                ((w.x, w.y, w.w, w.h), w.title)
-            }
-        };
-        if win_rect.2 <= 0 || win_rect.3 <= 0 {
-            return Err("target window has an empty rect".into());
-        }
-        let frame = crate::dxgi::with(|dx| {
-            dx.capture_for_point((win_rect.0 + win_rect.2 / 2, win_rect.1 + win_rect.3 / 2))
-        })?;
-        let x0 = (win_rect.0 - frame.origin.0).max(0);
-        let y0 = (win_rect.1 - frame.origin.1).max(0);
-        let cw = (win_rect.2 as u32)
-            .min(frame.w.saturating_sub(x0 as u32))
-            .max(1);
-        let ch = (win_rect.3 as u32)
-            .min(frame.h.saturating_sub(y0 as u32))
-            .max(1);
-        let (crop, cw, ch) =
-            crate::dxgi::crop_bgra(&frame.bgra, frame.w, frame.h, x0, y0, cw, ch);
-        let crop_origin = (frame.origin.0 + x0, frame.origin.1 + y0);
-        let ocr = ctx.ocr()?.recognize(&crop, cw, ch, None)?;
-        let m = crate::ocr::find_query_rect(&text_query, &ocr.lines).ok_or_else(|| {
-            format!(
-                "text '{text_query}' not found on screen (OCR read {} lines in \"{}\")",
-                ocr.lines.len(),
-                win_title
-            )
-        })?;
-        let sx = crop_origin.0 + m.0;
-        let sy = crop_origin.1 + m.1;
-        let cx = sx + m.2 / 2;
-        let cy = sy + m.3 / 2;
-        let done = match action.as_str() {
-            "click" => crate::input::click_at(cx, cy, "left", 1)?,
-            "double_click" => crate::input::click_at(cx, cy, "left", 2)?,
-            "type_after_click" => {
-                crate::input::click_at(cx, cy, "left", 1)?;
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                let it = input_text
-                    .ok_or("type_after_click requires 'input_text'")?;
-                // Clipboard + Ctrl+V is fast and unicode-safe; fall back to
-                // char typing when the clipboard is busy.
-                match crate::clipboard::set_text(&it) {
-                    Ok(_) => {
-                        std::thread::sleep(std::time::Duration::from_millis(80));
-                        crate::input::send_hotkey("Ctrl+v")?;
-                        format!("pasted {} chars via Ctrl+V", it.chars().count())
-                    }
-                    Err(_) => crate::input::type_text(&it)?,
-                }
-            }
-            other => {
-                return Err(format!(
-                    "unknown action '{other}' (use click|double_click|type_after_click)"
-                ))
-            }
-        };
-        Ok(format!(
-            "ocr_click_text: matched \"{text_query}\" at (x: {sx}, y: {sy}, w: {w}, h: {h}) screen px, {done}",
-            w = m.2,
-            h = m.3
-        ))
+        let r = ocr_click_impl(ctx, &text_query, &action, input_text.as_deref(), target.as_deref())?;
+        Ok(format!("ocr_click_text: {r}"))
     })?;
     Ok(vec![Content::Text(out)])
+}
+
+// ---------- system_macro ----------
+
+/// Execute a validated macro step sequence on the COM thread. Steps run
+/// sequentially with `delay_ms` between them; the macro aborts on the first
+/// failing step and reports everything completed so far.
+fn execute_macro(
+    ctx: &mut crate::actor::Ctx,
+    steps: &[Value],
+    delay_ms: u64,
+) -> Result<String, String> {
+    let mut report = String::with_capacity(1024);
+    for (i, step) in steps.iter().enumerate() {
+        let action = step.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+        let res: Result<String, String> = match action {
+            "hotkey" => crate::input::send_hotkey(
+                crate::macros::step_str(step, "keys").unwrap_or_default(),
+            ),
+            "type" => crate::input::type_text(crate::macros::step_str(step, "text").unwrap_or("")),
+            "click" => {
+                let x = crate::macros::step_i64(step, "x").unwrap_or(0) as i32;
+                let y = crate::macros::step_i64(step, "y").unwrap_or(0) as i32;
+                let button = crate::macros::step_str(step, "button").unwrap_or("left");
+                let clicks = crate::macros::step_i64(step, "clicks").unwrap_or(1).max(1) as u32;
+                crate::input::click_at(x, y, button, clicks)
+            }
+            "double_click" => {
+                let x = crate::macros::step_i64(step, "x").unwrap_or(0) as i32;
+                let y = crate::macros::step_i64(step, "y").unwrap_or(0) as i32;
+                crate::input::click_at(x, y, "left", 2)
+            }
+            "right_click" => {
+                let x = crate::macros::step_i64(step, "x").unwrap_or(0) as i32;
+                let y = crate::macros::step_i64(step, "y").unwrap_or(0) as i32;
+                crate::input::click_at(x, y, "right", 1)
+            }
+            "move" => {
+                let x = crate::macros::step_i64(step, "x").unwrap_or(0) as i32;
+                let y = crate::macros::step_i64(step, "y").unwrap_or(0) as i32;
+                crate::input::move_mouse(x, y, true)?;
+                Ok(format!("cursor at ({x},{y})"))
+            }
+            "drag" => {
+                let x1 = crate::macros::step_i64(step, "x").unwrap_or(0) as i32;
+                let y1 = crate::macros::step_i64(step, "y").unwrap_or(0) as i32;
+                let x2 = crate::macros::step_i64(step, "to_x").unwrap_or(0) as i32;
+                let y2 = crate::macros::step_i64(step, "to_y").unwrap_or(0) as i32;
+                let dur = crate::macros::step_i64(step, "duration_ms").unwrap_or(300).clamp(60, 5000) as u32;
+                crate::input::drag(x1, y1, x2, y2, dur)
+            }
+            "scroll" => {
+                let delta = crate::macros::step_i64(step, "delta").unwrap_or(-360) as i32;
+                let x = crate::macros::step_i64(step, "x").map(|v| v as i32);
+                let y = crate::macros::step_i64(step, "y").map(|v| v as i32);
+                crate::input::scroll(x, y, delta)
+            }
+            "wait" => {
+                let ms = crate::macros::step_i64(step, "ms").unwrap_or(200).clamp(10, 5000) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                Ok(format!("waited {ms} ms"))
+            }
+            "focus" => {
+                let target = crate::macros::step_str(step, "target").unwrap_or_default();
+                let w = window::find_window(target)
+                    .ok_or_else(|| format!("no window matches '{target}'"))?;
+                window::focus_window(w.hwnd)?;
+                Ok(format!("focused \"{}\" (hwnd 0x{:x})", w.title, w.hwnd))
+            }
+            "launch" => {
+                let command = crate::macros::step_str(step, "command").unwrap_or_default();
+                let launch_args = crate::macros::step_str(step, "args").unwrap_or_default();
+                window::launch_app(command, launch_args)
+            }
+            "ocr_click" => {
+                let text_query =
+                    crate::macros::step_str(step, "text_query").unwrap_or_default();
+                let a = crate::macros::step_str(step, "action").unwrap_or("click");
+                let it = crate::macros::step_str(step, "input_text");
+                let t = crate::macros::step_str(step, "target_window");
+                ocr_click_impl(ctx, text_query, a, it, t)
+            }
+            "clipboard_set" => crate::clipboard::set_text(
+                crate::macros::step_str(step, "text").unwrap_or_default(),
+            ),
+            _ => Err(format!("unsupported action '{action}'")),
+        };
+        match res {
+            Ok(detail) => report.push_str(&format!("{}. {} — {}\n", i + 1, action, detail)),
+            Err(e) => {
+                return Err(format!(
+                    "macro aborted at step {}/{} ('{action}'): {e}\n\nCompleted before abort:\n{report}",
+                    i + 1,
+                    steps.len()
+                ))
+            }
+        }
+        if i + 1 < steps.len() && delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+    }
+    Ok(report)
+}
+
+fn system_macro_tool(actor: &Actor, args: &Value) -> Result<Vec<Content>, String> {
+    let action = arg_str(args, "action").ok_or(
+        "system_macro requires action (run|save|load|list|delete)",
+    )?;
+    let name = arg_str(args, "name");
+    let steps = args.get("steps").cloned();
+    let delay_ms = arg_i64(args, "step_delay_ms")
+        .unwrap_or(150)
+        .clamp(0, 2000) as u64;
+
+    match action.as_str() {
+        "run" => {
+            // Inline steps or a saved macro name.
+            let steps = match (&steps, &name) {
+                (Some(s), _) => crate::macros::parse_steps(s)?,
+                (None, Some(n)) => crate::macros::load_macro(n)?,
+                _ => return Err("run requires either 'steps' (array) or 'name' (saved macro)".into()),
+            };
+            let n = steps.len();
+            let out = block(actor, move |ctx| {
+                let r = execute_macro(ctx, &steps, delay_ms)?;
+                Ok(format!("macro run: {n} steps executed\n\n{r}"))
+            })?;
+            Ok(vec![Content::Text(out)])
+        }
+        "save" => {
+            let name = name.ok_or("save requires 'name'")?;
+            let steps_raw = steps.ok_or("save requires 'steps' (array)")?;
+            let steps = crate::macros::parse_steps(&steps_raw)?;
+            let out = block(actor, move |_| {
+                let path = crate::macros::save_macro(&name, &steps)?;
+                Ok(format!(
+                    "saved macro \"{}\" ({} steps) → {}",
+                    name,
+                    steps.len(),
+                    path
+                ))
+            })?;
+            Ok(vec![Content::Text(out)])
+        }
+        "load" => {
+            let name = name.ok_or("load requires 'name'")?;
+            let steps = crate::macros::load_macro(&name)?;
+            let n = steps.len();
+            let out = block(actor, move |ctx| {
+                let r = execute_macro(ctx, &steps, delay_ms)?;
+                Ok(format!("macro \"{name}\": {n} steps executed\n\n{r}"))
+            })?;
+            Ok(vec![Content::Text(out)])
+        }
+        "list" => {
+            let out = block(actor, move |_| {
+                let macros = crate::macros::list_macros();
+                if macros.is_empty() {
+                    return Ok("no saved macros yet (save one with action=save)".into());
+                }
+                let mut s = format!("{} saved macros:\n", macros.len());
+                for (n, count, _ms) in macros {
+                    s.push_str(&format!("  - {n} ({count} steps)\n"));
+                }
+                Ok(s)
+            })?;
+            Ok(vec![Content::Text(out)])
+        }
+        "delete" => {
+            let name = name.ok_or("delete requires 'name'")?;
+            let out = block(actor, move |_| {
+                let path = crate::macros::delete_macro(&name)?;
+                Ok(format!("deleted macro \"{name}\" ({path})"))
+            })?;
+            Ok(vec![Content::Text(out)])
+        }
+        other => Err(format!(
+            "unknown system_macro action '{other}' (use run|save|load|list|delete)"
+        )),
+    }
 }
 
 fn region_center(r: &(i32, i32, i32, i32)) -> (i32, i32) {    if r.2 > 0 && r.3 > 0 {
@@ -846,9 +1050,9 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_eight_valid_schemas() {
+    fn tools_list_has_nine_valid_schemas() {
         let tools = tool_defs();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         for t in &tools {
             assert!(t["name"].is_string(), "tool missing name");
             assert_eq!(t["inputSchema"]["type"], "object", "schema must be an object schema");
@@ -861,6 +1065,7 @@ mod tests {
             "visual_som_capture",
             "ocr_read_region",
             "ocr_click_text",
+            "system_macro",
             "window_manager",
             "input_macro",
             "clipboard",

@@ -23,6 +23,7 @@ Full benchmarks: [BENCHMARKS.md](BENCHMARKS.md). Prebuilt exe in
 | `ocr_read_region` | Offline OCR of any region (Windows.Media.Ocr), per-line boxes in screen coordinates | ~20–50 ms |
 | `window_manager` | list_windows, focus, minimize/maximize/restore, snap_left/right/full, launch_app, wait_for_window (with OCR text check), recent_events (SetWinEventHook) | ms |
 | `input_macro` | hotkey (`Ctrl+Shift+P`), type_text (Unicode), click/move/drag/scroll | ms |
+| `system_macro` | **v0.2.1**: replayable macros — a sequence of steps (focus window → click → type → hotkey → scroll → drag → wait → launch app → OCR-click → clipboard) executed in ONE call with inter-step delays; named macros persist to `%USERPROFILE%\.winvision-mcp\macros` (save/load/list/delete) | ms per step |
 | `clipboard` | get/set CF_UNICODETEXT | ms |
 
 ## Architecture

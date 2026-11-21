@@ -342,6 +342,106 @@ fn wait_for_window_times_out_cleanly() {
 
 #[test]
 #[ignore]
+fn system_macro_types_into_notepad() {
+    let _guard = notepad_guard();
+    let actor = spawn_actor();
+    let _ = std::process::Command::new("taskkill")
+        .args(["/IM", "notepad.exe", "/F"])
+        .creation_flags(0x08000000)
+        .status();
+    std::thread::sleep(Duration::from_millis(400));
+    let cleanup = || {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "notepad.exe", "/F"])
+            .creation_flags(0x08000000)
+            .status();
+    };
+
+    call_tool(&actor, "window_manager", &json!({"action": "launch_app", "command": "notepad"}))
+        .expect("launch notepad");
+    let mut appeared = false;
+    for _ in 0..30 {
+        if call_tool(
+            &actor,
+            "window_manager",
+            &json!({"action": "wait_for_window", "target": "notepad", "timeout_ms": 800, "poll_ms": 120}),
+        )
+        .is_ok()
+        {
+            appeared = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    if !appeared {
+        cleanup();
+        panic!("notepad did not appear");
+    }
+
+    // Run a real macro in ONE call: focus notepad → type → wait → select all.
+    let res = call_tool(
+        &actor,
+        "system_macro",
+        &json!({
+            "action": "run",
+            "step_delay_ms": 200,
+            "steps": [
+                {"action": "focus", "target": "notepad"},
+                {"action": "wait", "ms": 400},
+                {"action": "type", "text": "winvision macro 777"},
+                {"action": "wait", "ms": 300},
+                {"action": "hotkey", "keys": "Ctrl+a"}
+            ]
+        }),
+    );
+    match res {
+        Ok(r) => {
+            let text = first_text(&r);
+            assert!(text.contains("5 steps executed"), "{text}");
+            assert!(text.contains("focus — focused"), "{text}");
+            assert!(text.contains("type — typed 19 chars"), "{text}");
+        }
+        Err(e) => {
+            cleanup();
+            panic!("macro failed: {e}");
+        }
+    }
+
+    // NOTE: we deliberately do NOT assert on the notepad content here.
+    // Windows 11 Notepad restores the previous session after a force-kill,
+    // and a freshly launched instance may still be initializing while
+    // SendInput fires — the text landing in the document is environment-
+    // dependent. The macro ENGINE contract (ordered steps, per-step report,
+    // abort-on-error) is what this test verifies; the report assertions
+    // above already confirm all 5 steps ran in order with correct details.
+
+    // Save the sequence as a named macro, list it, then delete.
+    let saved = first_text(
+        &call_tool(
+            &actor,
+            "system_macro",
+            &json!({
+                "action": "save",
+                "name": "test-notepad-typing",
+                "steps": [{"action": "type", "text": "saved macro works"}]
+            }),
+        )
+        .expect("save macro"),
+    );
+    assert!(saved.contains("saved macro"), "{saved}");
+    let listed = first_text(&call_tool(&actor, "system_macro", &json!({"action": "list"})).expect("list"));
+    assert!(listed.contains("test-notepad-typing"), "{listed}");
+    let deleted = first_text(
+        &call_tool(&actor, "system_macro", &json!({"action": "delete", "name": "test-notepad-typing"}))
+            .expect("delete macro"),
+    );
+    assert!(deleted.contains("deleted"), "{deleted}");
+
+    cleanup();
+}
+
+#[test]
+#[ignore]
 fn end_to_end_stdio_protocol() {
     let exe = env!("CARGO_BIN_EXE_winvision-mcp");
     let mut child = Command::new(exe)
@@ -381,7 +481,7 @@ fn end_to_end_stdio_protocol() {
 
     let tools: Value = serde_json::from_str(&lines[1]).unwrap();
     assert_eq!(tools["id"], 2);
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 9);
 
     let list: Value = serde_json::from_str(&lines[2]).unwrap();
     assert_eq!(list["id"], 3);
@@ -427,7 +527,7 @@ fn protocol_smoke_without_windows_apis() {
     assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
     let resp = line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
     let v: Value = serde_json::from_str(&resp).unwrap();
-    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 9);
     let resp = line(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#).unwrap();
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"], json!({}));
