@@ -1,87 +1,155 @@
-# WinVision MCP
+# winvision-mcp
 
-An ultra-fast local MCP server (Model Context Protocol, stdio JSON-RPC 2.0)
-for ZCode: native Windows "vision" and desktop control in pure Rust. It
-replaces the slow screenshot → pixel-guessing → click loop with instant
-access to the UI Automation tree, hardware-level DXGI screen capture and
-event-driven window monitoring.
+Local MCP server (Model Context Protocol, stdio JSON-RPC 2.0) for Windows 10/11, written in pure Rust. Exposes Windows UI Automation trees, hardware screen capture via DXGI Desktop Duplication (automatic GDI BitBlt fallback), offline OCR via Windows.Media.Ocr, and Win32 `SendInput` emulation. Ships as a single release binary (~975 KB with strip + LTO), zero external runtime dependencies, zero network calls.
 
-**Speed (p50, full JSON-RPC round trip, live desktop):** warm window
-snapshot — **34 ms**, button click via a UIA pattern — **0.3 ms**, screen
-region OCR — **44 ms**, capture + Set-of-Mark overlay — **72 ms**.
-Full benchmarks: [BENCHMARKS.md](BENCHMARKS.md). Prebuilt exe in
-[Releases](../../releases).
+Works with any MCP client that launches a stdio server: Claude Code, Claude Desktop, Cursor, OpenAI Codex CLI, Windsurf, Cline, Roo Code, ZCode CLI, and others. Configuration snippets: [Client configuration](#client-configuration) and [examples/configs/](examples/configs/).
 
 ## Tools
 
-| Tool | Purpose | Speed |
+| Tool | Function | p50 / p95 |
 |---|---|---|
-| `desktop_snapshot` | Instant "X-ray" of a window via UI Automation: interactive elements with short IDs `[N]` and screen rects. Browsers (Chrome/Edge/Firefox/Zen/Floorp/Brave) are woken automatically (WM_GETOBJECT + screen-reader flag) with walk depth 14 | warm ~10–50 ms |
-| `ui_interact` | click / double_click / right_click / focus / set_value / toggle by `element_id`; tries native patterns first (Invoke/Value/Toggle/SelectionItem/ExpandCollapse), falls back to a hardware SendInput click | ~0.3–5 ms |
-| `ocr_click_text` | Click exactly on text on screen: capture (DXGI/GDI) → OCR → bounding box of the found text → SendInput click at its center; `type_after_click` pastes text via Ctrl+V. Works on sites with no UIA tree, Canvas, captchas | ~50–150 ms |
-| `visual_som_capture` | JPEG frame via DXGI Desktop Duplication with Set-of-Mark badges on windows/OCR lines + a coordinate table | < 5 ms capture |
-| `ocr_read_region` | Offline OCR of any region (Windows.Media.Ocr), per-line boxes in screen coordinates | ~20–50 ms |
-| `window_manager` | list_windows, focus, minimize/maximize/restore, snap_left/right/full, launch_app, wait_for_window (with OCR text check), recent_events (SetWinEventHook) | ms |
-| `input_macro` | hotkey (`Ctrl+Shift+P`), type_text (Unicode), click/move/drag/scroll | ms |
-| `system_macro` | **v0.2.1**: replayable macros — a sequence of steps (focus window → click → type → hotkey → scroll → drag → wait → launch app → OCR-click → clipboard) executed in ONE call with inter-step delays; named macros persist to `%USERPROFILE%\.winvision-mcp\macros` (save/load/list/delete) | ms per step |
-| `clipboard` | get/set CF_UNICODETEXT | ms |
+| `desktop_snapshot` | UIA tree of a window as an ID-tagged element list with screen rects. Browser accessibility trees are woken automatically; walk depth 14 for browser windows | 34 ms / 48 ms |
+| `ui_interact` | click / double_click / right_click / focus / set_value / toggle by element ID; native UIA patterns first, hardware `SendInput` fallback | 0.3 ms / 1.1 ms |
+| `ocr_click_text` | capture → OCR → word-level bounding box of the query → `SendInput` click / double_click / type_after_click (clipboard paste) | 44 ms / 393 ms* |
+| `visual_som_capture` | DXGI frame with numbered Set-of-Mark badges on windows/OCR lines + coordinate table | 72 ms / 421 ms* |
+| `ocr_read_region` | offline OCR of a screen region, per-line boxes in screen coordinates | 44 ms / 393 ms* |
+| `window_manager` | list_windows, focus, minimize/maximize/restore, snap_left/right/full, launch_app, wait_for_window, recent_events | 1.4 ms / 3.8 ms |
+| `input_macro` | hotkey, type_text (Unicode), click, move, drag, scroll | ms-range |
+| `system_macro` | replayable step sequences (focus / click / type / hotkey / scroll / drag / wait / launch / ocr_click / clipboard_set) in one call; named macros persist on disk | ms per step |
+| `clipboard` | get/set `CF_UNICODETEXT` | 1.1 ms / 1.2 ms |
 
-## Architecture
+Latencies: full JSON-RPC round trip on a live desktop (Core i5-10400, GTX 1660 SUPER, 2560×1440, Windows 11 build 26300). Methodology and hardware details: [BENCHMARKS.md](BENCHMARKS.md).
+\* Capture-tool p95 includes the automatic GDI fallback path described under [Architecture notes](#architecture-notes).
 
-```
-src/
-  main.rs      — startup: DPI-aware, COM actor, tokio stdio
-  mcp.rs       — MCP transport: initialize/tools/list/tools/call, schemas for 8 tools
-  actor.rs     — dedicated COM thread (CoInitializeEx MTA + message pump), all Win32/COM calls
-  uia.rs       — UIA: batched tree cache (BuildUpdatedCache, TreeScope=Subtree — 1 round trip),
-                 10 s ID→element cache, patterns + fallback, browser accessibility auto-wake
-  dxgi.rs      — DXGI Desktop Duplication: one duplication per process (global singleton),
-                 survives ACCESS_LOST / mode changes / monitor switches, GDI fallback
-  som.rs       — Set-of-Mark: numbered color badges (built-in 5x7 font), grid, JPEG
-  ocr.rs       — Windows.Media.Ocr: engine creation with fallbacks, word/line boxes
-  window.rs    — EnumWindows/ShowWindow/snap/launch (foreground-lock workaround via Alt tap)
-  events.rs    — SetWinEventHook (foreground/show/destroy/namechange) into a ring buffer
-  input.rs     — SendInput: hotkeys, Unicode typing, interpolated drag, wheel
-  clipboard.rs — CF_UNICODETEXT
-```
+## Architecture notes
 
-## Building
+- Dedicated MTA COM actor thread with a Win32 message pump (`actor.rs`); all UIA, DXGI and OCR state is owned by that thread, the async stdio loop never touches COM directly.
+- Single-roundtrip batched UIA tree caching: `BuildUpdatedCache` with `TreeScope=Subtree` fetches an entire window in one cross-process call; element handles are kept in a 10 s TTL cache for `ui_interact`.
+- Automatic browser accessibility wake-up (Chrome, Edge, Firefox, Zen, Brave, Floorp, LibreWolf, Opera, Vivaldi): `WM_GETOBJECT` with `OBJID_CLIENT` via `SendMessageTimeoutW` plus a temporary `SPI_SETSCREENREADER` flag, restored after the scan.
+- Process-wide DXGI Output Duplication singleton with automatic session recovery on `DXGI_ERROR_ACCESS_LOST` and immediate GDI BitBlt fallback when DWM pauses composition (fullscreen apps, animated-wallpaper software).
+- Event-driven window state tracking via `SetWinEventHook` into a bounded ring buffer.
+- Input emulation via `SendInput` (scan codes + `KEYEVENTF_UNICODE`), mouse coordinates normalized across the virtual desktop.
+
+## Build from source
+
+Requires a Rust toolchain (edition 2021) and Windows 10/11.
 
 ```powershell
-cargo build --release     # target/release/winvision-mcp.exe
-cargo clippy --all-targets
-cargo test                # 43 unit tests
-cargo test -- --ignored   # 10 integration tests (real UIA/DXGI/OCR/stdio, needs an interactive desktop)
+git clone https://github.com/USBc388/winvision-mcp.git
+cd winvision-mcp
+cargo build --release
 ```
 
-## Connecting to ZCode
+Output binary: `target\release\winvision-mcp.exe`.
 
-In `~/.zcode/cli/config.json`:
+## Binary verification
+
+Released binaries are hashed with SHA256; the digest is recorded in [SHA256SUMS.txt](SHA256SUMS.txt) and in the release notes.
+
+```powershell
+Get-FileHash .\winvision-mcp.exe -Algorithm SHA256
+```
+
+## Client configuration
+
+Any MCP client that launches a stdio server works. Standalone files: [examples/configs/](examples/configs/). Replace `C:\tools\winvision-mcp.exe` with the actual binary path.
+
+<details>
+<summary>Claude Code</summary>
+
+`~/.claude.json` (or project-level `.mcp.json`):
+
 ```json
-"mcp": { "servers": { "winvision": {
-  "command": "C:\\tools\\winvision-mcp.exe",
-  "args": []
-} } }
+{"mcpServers":{"winvision":{"type":"stdio","command":"C:\\tools\\winvision-mcp.exe","args":[]}}}
 ```
 
-A skill file describing usage rules lives in
-`.zcode/skills/winvision/SKILL.md` (per-project) and
-`~/.zcode/skills/winvision/SKILL.md` (global).
+CLI alternative:
 
-Manual smoke check:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-release.ps1
+claude mcp add winvision -- C:\tools\winvision-mcp.exe
 ```
 
-## Notes
+</details>
 
-- The first UIA call in a process pays cold COM initialization (~300–700 ms);
-  warm snapshots of typical windows take 10–50 ms. The desktop shell window
-  (`Program Manager`) answers its provider in ~650 ms — an explorer-side
-  limitation, not a server one.
-- Browsers wake their accessibility tree on demand; the server sends the
-  wake probe automatically on every browser snapshot (v0.2.0+).
-- Fully static screens (e.g. an animated-wallpaper app paused behind a
-  focused window can stop NVIDIA from delivering duplication frames) fall
-  back to a GDI BitBlt capture automatically.
-- OCR requires a Windows language pack (en-US / ru-RU, etc.).
+<details>
+<summary>Cursor</summary>
+
+`~/.cursor/mcp.json`:
+
+```json
+{"mcpServers":{"winvision":{"command":"C:\\tools\\winvision-mcp.exe","args":[]}}}
+```
+
+</details>
+
+<details>
+<summary>OpenAI Codex CLI</summary>
+
+`~/.codex/config.toml`:
+
+```toml
+[mcp_servers.winvision]
+command = "C:\\tools\\winvision-mcp.exe"
+args = []
+```
+
+</details>
+
+<details>
+<summary>Windsurf</summary>
+
+`~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{"mcpServers":{"winvision":{"command":"C:\\tools\\winvision-mcp.exe","args":[]}}}
+```
+
+</details>
+
+<details>
+<summary>Cline / Roo Code</summary>
+
+`cline_mcp_settings.json` (Roo Code uses the same format):
+
+```json
+{"mcpServers":{"winvision":{"command":"C:\\tools\\winvision-mcp.exe","args":[],"alwaysAllow":["desktop_snapshot","ui_interact","ocr_click_text","visual_som_capture","ocr_read_region","window_manager","input_macro","system_macro","clipboard"]}}}
+```
+
+</details>
+
+<details>
+<summary>Claude Desktop</summary>
+
+`%APPDATA%\Claude\claude_desktop_config.json`:
+
+```json
+{"mcpServers":{"winvision":{"command":"C:\\tools\\winvision-mcp.exe","args":[]}}}
+```
+
+</details>
+
+<details>
+<summary>ZCode CLI</summary>
+
+`~/.zcode/cli/config.json`:
+
+```json
+{"mcp":{"servers":{"winvision":{"command":"C:\\tools\\winvision-mcp.exe","args":[]}}}}
+```
+
+</details>
+
+## Tests
+
+```powershell
+cargo clippy --all-targets
+cargo test                # 49 unit tests
+cargo test -- --ignored   # 11 integration tests (real UIA/DXGI/OCR; interactive desktop required)
+```
+
+## Known limitations
+
+- The first UIA call in a process pays COM initialization (~300–700 ms); warm snapshots of typical windows take 10–50 ms. The explorer desktop-shell window answers in ~650 ms (provider-side cost).
+- Browser pages build their UIA trees lazily; the server wakes them per snapshot, but heavily loaded pages may still need a retry.
+- OCR requires a Windows language pack matching the on-screen text.
+- A fully static desktop can stop NVIDIA drivers from producing duplication frames; the server falls back to GDI capture automatically.

@@ -28,7 +28,7 @@ which triggers when the desktop is fully static.*
 
 - **Cold start (~300–400 ms)** happens once per server process: COM
   initialization, UIA client bootstrap and the first provider round trip.
-  ZCode keeps the server alive for the whole session, so warm calls are what
+  MCP clients keep the server alive for the whole session, so warm calls are what
   matter.
 - **Warm snapshot ≈ 30–35 ms** even though the UIA tree walk is one batched
   cross-process call (`BuildUpdatedCache` with `TreeScope=Subtree`): the

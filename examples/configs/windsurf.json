@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "winvision": {
+      "command": "C:\\tools\\winvision-mcp.exe",
+      "args": []
+    }
+  }
+}

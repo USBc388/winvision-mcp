@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "winvision": {
+      "command": "C:\\tools\\winvision-mcp.exe",
+      "args": [],
+      "alwaysAllow": [
+        "desktop_snapshot",
+        "ui_interact",
+        "ocr_click_text",
+        "visual_som_capture",
+        "ocr_read_region",
+        "window_manager",
+        "input_macro",
+        "system_macro",
+        "clipboard"
+      ]
+    }
+  }
+}

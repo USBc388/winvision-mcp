@@ -1,4 +1,4 @@
-//! WinVision — ultra-fast local Windows "vision" MCP server for ZCode.
+//! WinVision — local Windows vision and desktop control MCP server (stdio JSON-RPC 2.0).
 //!
 //! Modules:
 //! - [`mcp`]: MCP JSON-RPC 2.0 transport over stdio (newline-delimited).

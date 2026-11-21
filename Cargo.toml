@@ -2,7 +2,7 @@
 name = "winvision-mcp"
 version = "0.2.1"
 edition = "2021"
-description = "WinVision: native Windows UI Automation + DXGI capture + OCR MCP server for ZCode"
+description = "Native Windows desktop control MCP server: UI Automation snapshots, DXGI Set-of-Mark capture, offline OCR, SendInput. Pure Rust."
 
 [lib]
 name = "winvision_mcp"

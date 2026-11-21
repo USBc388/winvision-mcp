@@ -828,7 +828,7 @@ mod tests {
             assert!(is_browser_process(b), "must detect {b}");
         }
         assert!(is_browser_process(" floorp.exe "), "trims whitespace");
-        for n in ["notepad.exe", "explorer.exe", "zcode.exe", ""] {
+        for n in ["notepad.exe", "explorer.exe", "mspaint.exe", ""] {
             assert!(!is_browser_process(n), "must not detect {n}");
         }
     }
