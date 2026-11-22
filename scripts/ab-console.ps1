@@ -1,5 +1,3 @@
-# A/B: does Desktop Duplication work when the server is spawned
-# console-less (CreateNoWindow=$true) vs with a hidden console?
 $exe = "F:\skill creation\winvision-mcp\target\release\winvision-mcp.exe"
 
 function Test-Spawn($noWindow) {
