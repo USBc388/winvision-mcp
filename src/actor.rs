@@ -1,8 +1,3 @@
-//! COM actor: every Windows API touch (UIA, DXGI, OCR, windows, clipboard)
-//! happens on one dedicated OS thread so COM apartments, D3D contexts and
-//! caches never cross threads. Jobs are closures sent over a channel; the
-//! thread also pumps Windows messages for the SetWinEventHook observer.
-
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::time::Duration;
 
@@ -16,12 +11,10 @@ use crate::events;
 use crate::ocr::OcrCtx;
 use crate::uia::UiaCtx;
 
-/// Per-thread Windows state, initialized lazily on first use.
 pub struct Ctx {
     pub uia: Option<UiaCtx>,
     pub ocr: Option<OcrCtx>,
     pub event_state: std::sync::Arc<events::EventState>,
-    /// Set when a snapshot was already taken (used by wait_for_text).
     pub last_hwnd: isize,
 }
 
@@ -43,14 +36,13 @@ impl Ctx {
 
 type Job = Box<dyn FnOnce(&mut Ctx) + Send>;
 
-/// Handle used by the async layer to run work on the COM thread.
 #[derive(Clone)]
 pub struct Actor {
     tx: Sender<Job>,
 }
 
 impl Actor {
-    /// Spawn the COM thread (CoInitializeEx MTA + WinEvent hooks + message pump).
+    
     pub fn spawn() -> Actor {
         let (tx, rx) = channel::<Job>();
         std::thread::Builder::new()
@@ -71,7 +63,7 @@ impl Actor {
                     last_hwnd: 0,
                 };
                 loop {
-                    // Pump Windows messages so WinEvent callbacks are delivered.
+                    
                     unsafe {
                         let mut msg = MSG::default();
                         while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).0 != 0 {
@@ -90,8 +82,6 @@ impl Actor {
         Actor { tx }
     }
 
-    /// Run a closure on the COM thread, blocking the current thread.
-    /// Jobs are isolated with catch_unwind so a panic never kills the actor.
     pub fn call<R, F>(&self, f: F) -> Result<R, String>
     where
         R: Send + 'static,
