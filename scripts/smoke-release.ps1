@@ -1,4 +1,3 @@
-# WinVision release-binary smoke test via PowerShell (JSON-RPC over stdio).
 $exe = "F:\skill creation\winvision-mcp\target\release\winvision-mcp.exe"
 
 $init  = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ps-smoke","version":"0"}}}'
