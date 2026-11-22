@@ -1,11 +1,7 @@
-# WinVision benchmark: measures real MCP tool round-trips against the
-# release binary over stdio. Writes bench-results.md (markdown table).
-# ASCII only (PowerShell 5.1 safe).
 
 $ErrorActionPreference = "Stop"
 $exe = "F:\skill creation\winvision-mcp\target\release\winvision-mcp.exe"
 
-# ---------- helpers ----------
 function Req($id, $tool, $argsJson) {
     '{"jsonrpc":"2.0","id":' + $id + ',"method":"tools/call","params":{"name":"' + $tool + '","arguments":' + $argsJson + '}}'
 }
@@ -46,7 +42,6 @@ function Measure-Tool($script:stdin, $script:stdout, $idBase, $tool, $argsJson, 
     return $samples
 }
 
-# ---------- machine specs ----------
 function Machine-Specs {
     $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim()
     $gpu = (Get-CimInstance Win32_VideoController | Select-Object -First 1).Name
@@ -58,9 +53,9 @@ function Machine-Specs {
     return "CPU: $cpu  |  GPU: $gpu  |  RAM: $ram GB  |  $os ($ver)  |  display $($res.Width)x$($res.Height)"
 }
 
-# ---------- benchmark run ----------
+
 Write-Host "Machine: $(Machine-Specs)"
-# Fresh single-instance target: kill any leftover notepad first.
+
 Start-Process taskkill -ArgumentList "/IM notepad.exe /F" -WindowStyle Hidden -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 
@@ -77,7 +72,6 @@ $p = [System.Diagnostics.Process]::Start($psi)
 $stdin = $p.StandardInput
 $stdout = $p.StandardOutput
 
-# initialize
 $stdin.WriteLine('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"bench","version":"0"}}}')
 $stdin.Flush()
 $null = $stdout.ReadLine()
@@ -85,7 +79,6 @@ $stdin.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}'); $std
 
 try {
 
-# launch a typical app window as the target
 $stdin.WriteLine((Req 100 "window_manager" '{"action":"launch_app","command":"notepad"}')); $stdin.Flush()
 $null = $stdout.ReadLine()
 $stdin.WriteLine((Req 101 "window_manager" '{"action":"wait_for_window","target":"notepad","timeout_ms":10000,"poll_ms":150}')); $stdin.Flush()
@@ -99,11 +92,9 @@ $stdin.WriteLine((Req 102 "desktop_snapshot" '{"target_window":"notepad"}')); $s
 $snap1 = $stdout.ReadLine()
 $swCold.Stop()
 
-# Notepad's edit field may not be in the tree on the very first snapshot;
-# retry a few times until we find it.
 $editId = $null
 for ($try = 0; $try -lt 6; $try++) {
-    # Win11 Notepad's editor exposes as Document; classic one as Edit.
+    
     $m = [regex]::Match((Get-FirstText $snap1), '\[(\d+)\] (Edit|Document)')
     if ($m.Success) { $editId = $m.Groups[1].Value; break }
     Start-Sleep -Milliseconds 300
@@ -116,7 +107,7 @@ if (-not $editId) {
     Write-Host (Get-FirstText $snap1)
 }
 
-# warm snapshot stats
+
 $snapSamples = Measure-Tool $stdin $stdout 2 "desktop_snapshot" '{"target_window":"notepad"}' 1 15
 $focusSamples = $null
 $setValueSamples = $null
